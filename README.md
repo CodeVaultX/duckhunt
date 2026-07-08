@@ -89,7 +89,8 @@ SASL and NickServ can be configured **per connection**, overriding global defaul
 ```bash
 git clone https://github.com/CodeVaultX/duckhunt.git
 cd duckhunt
-
+```
+```bash
 cp config.json.example config.json
 
 # Create config.json (see Configuration section below)
@@ -123,8 +124,8 @@ python -m unittest discover -s tests -p "test_*.py"
   "commands": { "prefix": "!" },
   "admins": ["YourNick"],
   "duck_spawning": {
-    "spawn_min": 3600,
-    "spawn_max": 7200,
+    "spawn_min": 600,
+    "spawn_max": 1200,
     "timeout": 300
   }
 }
@@ -174,8 +175,8 @@ python -m unittest discover -s tests -p "test_*.py"
     { "nick": "TrustedAdmin", "hostmask": "*!user@trusted.host" }
   ],
   "duck_spawning": {
-    "spawn_min": 300,
-    "spawn_max": 900,
+    "spawn_min": 600,
+    "spawn_max": 1200,
     "timeout": 300,
     "flock_chance": 0.08
   }
