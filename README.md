@@ -234,8 +234,8 @@ Throughout this section:
 | `!profile` or `.profile` | Detailed stat card (PM) |
 | `!achievements` or `.achievements` | Earned badges (PM) |
 | `!help` / `!duckhelp` or `.help` / `.duckhelp` | Help (see [Help commands](#help-commands-new-behaviour) above) |
-| `!rearm` | Channel | Rearm yourself |
-| `!rearm <player>` | Channel | Rearm one player in current channel |
+| `!rearm` or `.rearm` | Channel | Rearm yourself |
+| `!rearm <player>` or `.rearm <player>` | Channel | Rearm one player in current channel |
 ### Help usage (summary)
 
 ```
