@@ -92,7 +92,9 @@ cd duckhunt
 ```
 ```bash
 cp config.json.example config.json
+```
 
+```bash
 # Create config.json (see Configuration section below)
 python duckhunt.py
 ```
