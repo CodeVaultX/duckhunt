@@ -234,7 +234,8 @@ Throughout this section:
 | `!profile` or `.profile` | Detailed stat card (PM) |
 | `!achievements` or `.achievements` | Earned badges (PM) |
 | `!help` / `!duckhelp` or `.help` / `.duckhelp` | Help (see [Help commands](#help-commands-new-behaviour) above) |
-
+| `!rearm` | Channel | Rearm yourself |
+| `!rearm <player>` | Channel | Rearm one player in current channel |
 ### Help usage (summary)
 
 ```
@@ -257,8 +258,6 @@ Admins must match `admins` in config (hostmask recommended).
 
 | Command | Where | Description |
 |---|---|---|
-| `!rearm` | Channel | Rearm yourself |
-| `!rearm <player>` | Channel | Rearm one player in current channel |
 | `!rearm all` | Channel | Rearm all confiscated players in channel |
 | `!rearm all` | PM | Rearm all players on this server |
 | `!rearm <#channel> <player>` | PM | Rearm a specific player in a channel |
