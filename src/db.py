@@ -8,11 +8,34 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from typing import Any, Dict, Generator, Optional, Tuple
 
 from .error_handling import ErrorRecovery, RetryConfig, sanitize_user_input, with_retry
+
+
+def server_db_filename(server: str) -> str:
+    """Return the per-server database file name for an IRC server host.
+
+    Every IRC server gets its own file (e.g. ``irc.rizon.net`` becomes
+    ``duckhunt_irc.rizon.net.json``) so two servers can never share one database -
+    which previously meant last-writer-wins data loss, plus a shared ``<file>.tmp``
+    that two writers could clobber (producing corrupt JSON backups).
+
+    The host is lower-cased and anything that isn't alphanumeric, ``.``, ``-`` or
+    ``_`` is replaced with ``_`` so the result is always a valid file name. When no
+    server is configured the legacy ``duckhunt.json`` is returned, so single-server
+    setups keep working with their existing file.
+    """
+    raw = server.strip().lower() if isinstance(server, str) else ""
+    if not raw:
+        return "duckhunt.json"
+    safe = "".join(ch if (ch.isalnum() or ch in ".-_") else "_" for ch in raw)
+    safe = safe.strip("._-") or "unknown"
+    return f"duckhunt_{safe}.json"
 
 
 class DuckDB:
@@ -48,12 +71,58 @@ class DuckDB:
         # what flush_pending_saves() waits on (bounded by its timeout).
         self._last_save_future = None
 
+        # Unique per DuckDB instance (pid + random token). The atomic-write temp file
+        # is derived from this, so two processes/instances writing the same database
+        # can never delete or truncate each other's half-written temp file (which was
+        # the source of the "WinError 32" failures and of unreadable JSON backups).
+        self._write_token = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
         data = self.load_database()
         # Hydrate in-memory state from disk.
         if isinstance(data, dict) and isinstance(data.get("channels"), dict):
             self.channels = data["channels"]
         else:
             self.channels = {}
+
+        # Keep a reference to the metadata dict itself, so the one-time migration
+        # flags set while loading (accuracy soft-cap/floor, ...) are written back by
+        # the next save instead of being re-applied on every single load.
+        metadata = data.get("metadata") if isinstance(data, dict) else None
+        self.metadata = metadata if isinstance(metadata, dict) else {}
+
+        # Remove temp files left behind by a previous crashed/killed process.
+        self._cleanup_stale_temp_files()
+
+        if getattr(self, "_needs_save_after_load", False):
+            try:
+                self.save_database()
+            except Exception as e:
+                self.logger.error(f"Failed to persist post-load migration: {e}")
+            finally:
+                self._needs_save_after_load = False
+
+    def _cleanup_stale_temp_files(self, max_age_seconds: float = 3600.0) -> None:
+        """Delete leftover ``<db_file>.<token>.tmp`` files from crashed processes.
+
+        Only files older than *max_age_seconds* are removed, so a temp file that is
+        currently being written by a live process is never touched.
+        """
+        try:
+            directory = os.path.dirname(self.db_file) or "."
+            prefix = os.path.basename(self.db_file) + "."
+            now = time.time()
+            for entry in os.listdir(directory):
+                if not (entry.startswith(prefix) and entry.endswith(".tmp")):
+                    continue
+                path = os.path.join(directory, entry)
+                try:
+                    if now - os.path.getmtime(path) > max_age_seconds:
+                        os.remove(path)
+                        self.logger.info(f"Removed stale temp database file: {entry}")
+                except OSError as e:
+                    self.logger.debug(f"Could not remove stale temp file {entry}: {e}")
+        except Exception as e:
+            self.logger.debug(f"Stale temp file cleanup skipped: {e}")
 
     @staticmethod
     def _normalize_channel(channel: str) -> str:
@@ -161,7 +230,7 @@ class DuckDB:
                 )
                 return self._create_default_database()
 
-            with open(self.db_file, "r") as f:
+            with open(self.db_file, "r", encoding="utf-8") as f:
                 content = f.read().strip()
 
             if not content:
@@ -230,6 +299,12 @@ class DuckDB:
         # Update last_modified
         data["metadata"]["last_modified"] = datetime.now().isoformat()
 
+        # One-time soft-cap: old players still have accuracy 75-100 from before
+        # player_defaults.accuracy was lowered, so they always hit at low levels.
+        self._apply_accuracy_soft_cap(data)
+        # One-time floor: raise players stuck at very low accuracy after soft-cap/miss spiral.
+        self._apply_accuracy_floor(data)
+
         total_players = 0
         try:
             for _c, cdata in data.get("channels", {}).items():
@@ -241,6 +316,104 @@ class DuckDB:
             f"Successfully loaded database with {total_players} players across {len(data.get('channels', {}))} channels"
         )
         return data
+
+    def _apply_accuracy_soft_cap(self, data: dict) -> None:
+        """Lower stored accuracy above the soft cap once per database file."""
+        try:
+            metadata = data.setdefault("metadata", {})
+            if metadata.get("accuracy_soft_cap_applied"):
+                return
+
+            cap = 55
+            if self.bot:
+                try:
+                    cap = int(
+                        self.bot.get_config("gameplay.accuracy_soft_cap", 55) or 55
+                    )
+                except (TypeError, ValueError):
+                    cap = 55
+            cap = max(10, min(100, cap))
+
+            capped = 0
+            channels = data.get("channels")
+            if not isinstance(channels, dict):
+                metadata["accuracy_soft_cap_applied"] = True
+                return
+
+            for _ch, cdata in channels.items():
+                if not isinstance(cdata, dict):
+                    continue
+                players = cdata.get("players")
+                if not isinstance(players, dict):
+                    continue
+                for _nick, player in players.items():
+                    if not isinstance(player, dict):
+                        continue
+                    try:
+                        acc = int(player.get("accuracy", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if acc > cap:
+                        player["accuracy"] = cap
+                        capped += 1
+
+            metadata["accuracy_soft_cap_applied"] = True
+            if capped:
+                self.logger.info(
+                    f"One-time accuracy soft-cap: lowered {capped} player(s) to {cap}%"
+                )
+                self._needs_save_after_load = True
+        except Exception as e:
+            self.logger.error(f"Error applying accuracy soft-cap: {e}")
+
+    def _apply_accuracy_floor(self, data: dict) -> None:
+        """Raise stored accuracy below the floor once per database file."""
+        try:
+            metadata = data.setdefault("metadata", {})
+            if metadata.get("accuracy_floor_applied"):
+                return
+
+            floor = 65
+            if self.bot:
+                try:
+                    floor = int(
+                        self.bot.get_config("gameplay.accuracy_floor", 65) or 65
+                    )
+                except (TypeError, ValueError):
+                    floor = 65
+            floor = max(10, min(100, floor))
+
+            raised = 0
+            channels = data.get("channels")
+            if not isinstance(channels, dict):
+                metadata["accuracy_floor_applied"] = True
+                return
+
+            for _ch, cdata in channels.items():
+                if not isinstance(cdata, dict):
+                    continue
+                players = cdata.get("players")
+                if not isinstance(players, dict):
+                    continue
+                for _nick, player in players.items():
+                    if not isinstance(player, dict):
+                        continue
+                    try:
+                        acc = int(player.get("accuracy", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if acc < floor:
+                        player["accuracy"] = floor
+                        raised += 1
+
+            metadata["accuracy_floor_applied"] = True
+            if raised:
+                self.logger.info(
+                    f"One-time accuracy floor: raised {raised} player(s) to {floor}%"
+                )
+                self._needs_save_after_load = True
+        except Exception as e:
+            self.logger.error(f"Error applying accuracy floor: {e}")
 
     def _recover_or_default(self, reason: str) -> dict:
         """Handle an unreadable primary database file without ever discarding data.
@@ -323,6 +496,11 @@ class DuckDB:
                 "version": "2.0",
                 "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "description": "DuckHunt Bot Player Database",
+                "metadata": {
+                    "version": "2.0",
+                    "created": datetime.now().isoformat(),
+                    "last_modified": datetime.now().isoformat(),
+                },
             }
 
             with open(self.db_file, "w", encoding="utf-8") as f:
@@ -340,6 +518,11 @@ class DuckDB:
                 "version": "2.0",
                 "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "description": "DuckHunt Bot Player Database",
+                "metadata": {
+                    "version": "2.0",
+                    "created": datetime.now().isoformat(),
+                    "last_modified": datetime.now().isoformat(),
+                },
             }
 
     @staticmethod
@@ -647,7 +830,11 @@ class DuckDB:
             if future is not None:
                 try:
                     future.result(timeout=timeout)
-                except TimeoutError:
+                except (TimeoutError, FuturesTimeoutError):
+                    # On Python 3.9/3.10 `Future.result(timeout=...)` raises
+                    # concurrent.futures.TimeoutError, which is NOT the builtin
+                    # TimeoutError there - catching only the builtin let the
+                    # exception escape this method on shutdown.
                     self.logger.error(
                         f"Timed out after {timeout}s waiting for pending database "
                         "saves to finish; the last save may not have completed."
@@ -665,6 +852,19 @@ class DuckDB:
         references back into the live `self.channels` structure).
         """
         data = {"channels": {}, "last_save": str(time.time()), "version": "2.0"}
+
+        # Metadata (including the one-time migration flags such as
+        # `accuracy_soft_cap_applied` / `accuracy_floor_applied`) must be part of the
+        # payload: without it those migrations ran again on every single load, which
+        # silently rewrote stored accuracy at every restart.
+        try:
+            metadata = dict(self.metadata) if isinstance(self.metadata, dict) else {}
+        except Exception:
+            metadata = {}
+        metadata["last_modified"] = datetime.now().isoformat()
+        metadata.setdefault("version", "2.0")
+        metadata.setdefault("created", metadata["last_modified"])
+        data["metadata"] = metadata
 
         valid_count = 0
         for channel_key, channel_data in (self.channels or {}).items():
@@ -702,7 +902,9 @@ class DuckDB:
         Runs on the background save executor thread - the blocking retry backoff and
         os.fsync here never touch the asyncio event loop.
         """
-        temp_file = f"{self.db_file}.tmp"
+        # Unique temp name (see `_write_token`): two writers of the same database path
+        # must never share one temp file, or one can delete what the other is writing.
+        temp_file = f"{self.db_file}.{self._write_token}.tmp"
 
         try:
             # Write to temporary file first (atomic write)
@@ -896,7 +1098,7 @@ class DuckDB:
                 jam_chance = self.bot.get_config("player_defaults.jam_chance", 15)
                 xp = self.bot.get_config("player_defaults.xp", 0)
             else:
-                accuracy = 75
+                accuracy = 40
                 magazines = 3
                 bullets_per_mag = 6
                 jam_chance = 15
@@ -956,7 +1158,7 @@ class DuckDB:
                 "current_ammo": 6,
                 "magazines": 3,
                 "bullets_per_magazine": 6,
-                "accuracy": 75,
+                "accuracy": 40,
                 "jam_chance": 15,
                 "gun_confiscated": False,
                 "confiscated_ammo": 0,

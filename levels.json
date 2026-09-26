@@ -9,7 +9,7 @@
       "min_xp": 0,
       "max_xp": 49,
       "befriend_success_rate": 95,
-      "accuracy_modifier": 25,
+      "accuracy_modifier": 5,
       "jam_chance": 0,
       "duck_spawn_speed_modifier": 1.0,
       "magazines": 3,

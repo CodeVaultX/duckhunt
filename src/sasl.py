@@ -118,12 +118,21 @@ class SASLHandler:
         """Handle CAP responses for SASL negotiation."""
         if len(params) < 2:
             return False
+        # Ignore CAP responses if we already ended negotiation.
+        if not self.cap_negotiating:
+            return False
 
         subcommand = params[1]
 
         if subcommand == "LS":
             caps = trailing.split() if trailing else []
             self.logger.info(f"Server capabilities: {caps}")
+            if not self.is_enabled():
+                # SASL disabled — end CAP and register normally.
+                # This is the standard IRCv3 path (Rizon, etc.).
+                self.logger.info("SASL not configured; ending CAP negotiation")
+                await self._abort_negotiation()
+                return True
             if self._has_sasl_cap(caps):
                 self.logger.info("SASL capability available")
                 self.bot.send_raw("CAP REQ :sasl")

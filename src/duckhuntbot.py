@@ -1,12 +1,13 @@
 import asyncio
 import os
 import signal
+import socket
 import ssl
 import sys
 import time
 from typing import Optional
 
-from .db import DuckDB
+from .db import DuckDB, server_db_filename
 from .error_handling import (
     ErrorRecovery,
     HealthChecker,
@@ -20,17 +21,11 @@ from .sasl import SASLHandler
 from .shop import ShopManager
 from .utils import MessageManager, parse_irc_message
 
-# Process-wide registry so Ctrl+C / SIGTERM marks every multi-server bot for shutdown.
-_running_bots: list = []
-_signals_installed = False
-
 
 class DuckHuntBot:
     def __init__(self, config):
         self.config = config
-        server_name = self.get_config("connection.server", "unknown")
-        safe_server = "".join(c for c in server_name if c.isalnum() or c in ".-_")
-        self.logger = setup_logger(f"DuckHuntBot.{safe_server}")
+        self.logger = setup_logger("DuckHuntBot")
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.registered = False
@@ -64,7 +59,7 @@ class DuckHuntBot:
         self.error_recovery = ErrorRecovery()
         self.health_checker = HealthChecker(check_interval=60.0)
 
-        self.db = DuckDB(db_file=f"duckhunt_{safe_server}.json", bot=self)
+        self.db = DuckDB(db_file=self._resolve_db_file(), bot=self)
         self.game = DuckGame(self, self.db)
         # Rate limiting state: per-nick token buckets to slow scripted abuse
         # Structure: {nick_lower: {'tokens': float, 'last_refill': float}}
@@ -95,11 +90,9 @@ class DuckHuntBot:
             )
             raw_prefix = "!"
         self.command_prefix = raw_prefix
-        
         self.messages = MessageManager(
             messages_file, command_prefix=self.command_prefix
         )
-
 
         self.sasl_handler = SASLHandler(self, config)
 
@@ -181,7 +174,10 @@ class DuckHuntBot:
             "globaltop": (False, lambda n, c, p, a, u: self.handle_globaltop(n, c)),
             "use": (False, lambda n, c, p, a, u: self.handle_use(n, c, p, a)),
             "give": (False, lambda n, c, p, a, u: self.handle_give(n, c, p, a)),
-            "duckhelp": (False, lambda n, c, p, a, u: self.handle_help(n, c, p, ["full"])),
+            "duckhelp": (
+                False,
+                lambda n, c, p, a, u: self.handle_help(n, c, p, ["full"]),
+            ),
             "help": (False, lambda n, c, p, a, u: self.handle_help(n, c, p, a)),
             "daily": (False, lambda n, c, p, a, u: self.handle_daily(n, c, p)),
             "effects": (False, lambda n, c, p, a, u: self.handle_effects(n, c, p)),
@@ -191,7 +187,10 @@ class DuckHuntBot:
             ),
             "inv": (False, lambda n, c, p, a, u: self.handle_inv(n, c, p)),
             "profile": (False, lambda n, c, p, a, u: self.handle_profile(n, c, p)),
-            "rearm": (True, lambda n, c, p, a, u: self.handle_rearm(n, c, a)),
+            # rearm is NOT in the admin-only set below on purpose: every player may
+            # rearm themselves (!rearm / !rearm <own nick>); handle_rearm enforces the
+            # admin-only targets (!rearm <other nick>, !rearm all) itself.
+            "rearm": (False, lambda n, c, p, a, u: self.handle_rearm(n, c, a, u)),
             "disarm": (True, lambda n, c, p, a, u: self.handle_disarm(n, c, a)),
             "ignore": (True, lambda n, c, p, a, u: self.handle_ignore(n, c, a)),
             "unignore": (True, lambda n, c, p, a, u: self.handle_unignore(n, c, a)),
@@ -240,6 +239,31 @@ class DuckHuntBot:
             else:
                 return default
         return value
+
+    def _resolve_db_file(self) -> str:
+        """Return this bot instance's database file.
+
+        Every IRC server gets its own database file derived from
+        ``connection.server`` (e.g. ``irc.rizon.net`` -> ``duckhunt_irc.rizon.net.json``)
+        so two servers can never share one file, where the last bot to save would
+        silently overwrite the other server's players (and both used the same
+        ``<file>.tmp`` while writing, which produced corrupt JSON backups).
+
+        ``connection.db_file`` overrides the derived name (useful for custom layouts);
+        without a configured server the legacy shared ``duckhunt.json`` is used.
+        """
+        override = self.get_config("connection.db_file")
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+
+        server = self.get_config("connection.server", "")
+        if not isinstance(server, str) or not server.strip():
+            self.logger.warning(
+                "No connection.server configured; falling back to the shared "
+                "'duckhunt.json' database. Configure one server per 'connections' "
+                "entry to keep each server's players isolated."
+            )
+        return server_db_filename(server)
 
     def _channel_key(self, channel: str) -> str:
         """Normalize channel for internal comparisons (IRC channels are case-insensitive)."""
@@ -337,38 +361,25 @@ class DuckHuntBot:
         return None, None
 
     def setup_signal_handlers(self):
-        """Setup process signal handlers once; notify every running bot on shutdown."""
-        global _signals_installed
-
-        if self not in _running_bots:
-            _running_bots.append(self)
-
-        if _signals_installed:
-            return
+        """Setup signal handlers for immediate shutdown"""
 
         def signal_handler(signum, _frame):
             signal_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
-            for bot in list(_running_bots):
-                bot.logger.info(
-                    f"Received {signal_name} (Ctrl+C), shutting down immediately..."
-                )
-                bot.shutdown_requested = True
+            self.logger.info(
+                f"Received {signal_name} (Ctrl+C), shutting down immediately..."
+            )
+            self.shutdown_requested = True
             try:
                 loop = asyncio.get_running_loop()
                 tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
                 for task in tasks:
                     task.cancel()
-                if _running_bots:
-                    _running_bots[0].logger.info(
-                        f"Cancelled {len(tasks)} running tasks"
-                    )
+                self.logger.info(f"Cancelled {len(tasks)} running tasks")
             except Exception as e:
-                if _running_bots:
-                    _running_bots[0].logger.error(f"Error cancelling tasks: {e}")
+                self.logger.error(f"Error cancelling tasks: {e}")
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        _signals_installed = True
 
     async def connect(self):
         """Connect to IRC server with comprehensive error handling"""
@@ -395,16 +406,47 @@ class DuckHuntBot:
 
                 server = self.get_config("connection.server", "irc.libera.chat")
                 port = self.get_config("connection.port", 6667)
+                bind_address = self.get_config("connection.bind_address")
+                local_addr = None
+                family = 0
+                if isinstance(bind_address, str):
+                    bind_address = bind_address.strip()
+                else:
+                    bind_address = None
+                if bind_address:
+                    # Pin outbound source IP (e.g. IPv6 with matching rDNS).
+                    # Must be a local address on this host; IPv6 bind only works
+                    # against servers that have AAAA records.
+                    local_addr = (bind_address, 0)
+                    if ":" in bind_address:
+                        # Prevent accidental IPv4 connect when an IPv6 source is set.
+                        family = socket.AF_INET6
+                    else:
+                        family = socket.AF_INET
+
+                bind_note = f" via {bind_address}" if bind_address else ""
                 self.logger.info(
-                    f"Attempting to connect to {server}:{port} (attempt {attempt + 1}/{max_retries})"
+                    f"Attempting to connect to {server}:{port}{bind_note} "
+                    f"(attempt {attempt + 1}/{max_retries})"
                 )
 
                 self.reader, self.writer = await asyncio.wait_for(
-                    asyncio.open_connection(server, port, ssl=ssl_context),
+                    asyncio.open_connection(
+                        server,
+                        port,
+                        ssl=ssl_context,
+                        local_addr=local_addr,
+                        family=family,
+                    ),
                     timeout=self.get_config("connection.timeout", 30) or 30.0,
                 )
 
-                self.logger.info(f"Successfully connected to {server}:{port}")
+                sockname = self.writer.get_extra_info("sockname")
+                peername = self.writer.get_extra_info("peername")
+                self.logger.info(
+                    f"Successfully connected to {server}:{port}"
+                    + (f" (local {sockname} -> peer {peername})" if sockname else "")
+                )
                 return
 
             except asyncio.TimeoutError:
@@ -436,14 +478,6 @@ class DuckHuntBot:
         try:
             encoded_msg = f"{msg}\r\n".encode("utf-8", errors="replace")
             self.writer.write(encoded_msg)
-            # Schedule a drain so TLS/TCP buffers actually flush. Without this,
-            # registration (NICK/USER) can sit unsent on some networks (seen on DALnet)
-            # until the peer times out the unreistered connection (~60-90s).
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._drain_writer())
-            except RuntimeError:
-                pass
             return True
         except ConnectionResetError:
             self.logger.error("Connection reset while sending message")
@@ -457,18 +491,6 @@ class DuckHuntBot:
         except Exception as e:
             self.logger.error(f"Unexpected error while sending message: {e}")
             return False
-
-    async def _drain_writer(self):
-        """Flush pending StreamWriter bytes without raising into fire-and-forget callers."""
-        writer = self.writer
-        if not writer or writer.is_closing():
-            return
-        try:
-            await writer.drain()
-        except (ConnectionResetError, BrokenPipeError, OSError) as e:
-            self.logger.debug(f"Writer drain failed: {e}")
-        except Exception as e:
-            self.logger.debug(f"Unexpected drain error: {e}")
 
     async def schedule_rejoin(self, channel):
         """Schedule automatic rejoin attempts for a channel after being kicked"""
@@ -634,7 +656,7 @@ class DuckHuntBot:
     async def _send_message_impl(self, target, msg):
         """Internal implementation of send_message"""
         try:
-            # Sanitize target and message (preserve Unicode channel names like #Fenerbahçe)
+            # Sanitize target and message (Unicode-safe channel names)
             safe_target = self._sanitize_channel(target)
             safe_msg = sanitize_user_input(msg, max_length=4000)
 
@@ -716,6 +738,11 @@ class DuckHuntBot:
         if password and password != "your_iline_password_here":
             self.logger.info("Sending server password")
             self.send_raw(f"PASS {password}")
+            if self.writer:
+                try:
+                    await self.writer.drain()
+                except Exception:
+                    pass
             return True
         return False
 
@@ -723,150 +750,108 @@ class DuckHuntBot:
         """Register user with IRC server (NICK/USER commands)"""
         nick = self.get_config("connection.nick", "DuckHunt")
         self.current_nick = nick
-        # Some IRCds (notably DALnet over TLS) drop unread handshakes if the
-        # client writes NICK/USER before the socket has settled. A short pause
-        # plus an explicit drain makes registration reliable.
-        settle = float(self.get_config("connection.register_delay", 0.5) or 0.5)
-        if settle > 0:
-            await asyncio.sleep(settle)
-        self.logger.info(f"Sending NICK/USER registration as {nick}")
         self.send_raw(f"NICK {nick}")
         self.send_raw(f"USER {nick} 0 * :{nick}")
-        await self._drain_writer()
+        if self.writer:
+            try:
+                await self.writer.drain()
+            except Exception:
+                pass
 
-    async def _registration_timeout_watch(self, timeout: float):
-        """Reconnect early if the server never completes IRC registration (001).
+    async def _fallback_register_after_delay(self, delay=3):
+        """If CAP LS hasn't been handled within *delay* seconds, register directly.
 
-        This task must NOT be watched with FIRST_COMPLETED in run(): on success it
-        finishes cleanly after ``timeout`` seconds and would otherwise tear down a
-        healthy connection (which is what dropped all bots ~45s after DALnet joined).
+        Some IRC servers (DALnet/bahamut) don't respond to CAP LS 302 at all,
+        so we must fall back to sending NICK/USER without CAP END.
         """
         try:
-            if timeout <= 0:
-                return
-            await asyncio.sleep(timeout)
-            if self.shutdown_requested or self.registered:
-                return
-            self.logger.error(
-                f"No IRC registration (001) within {timeout:.0f}s; "
-                "closing connection to retry"
-            )
-            await self._close_connection()
+            await asyncio.sleep(delay)
+            if not self.registered and self.sasl_handler.cap_negotiating:
+                self.logger.info(
+                    f"No CAP LS response within {delay}s; registering directly"
+                )
+                self.sasl_handler.end_negotiation()
+                await self.register_user()
         except asyncio.CancelledError:
-            return
+            pass
 
-    def _nickserv_password(self):
-        """NickServ password from nickserv.password, connection.nickserv, or sasl.password."""
-        placeholders = {
-            "",
-            "your_password_here",
-            "your_actual_password",
-            "NICK_SIFREN_BURAYA",
-        }
-        for path in (
-            "nickserv.password",
-            "connection.nickserv.password",
-            "sasl.password",
-        ):
-            password = self.get_config(path, "")
-            if isinstance(password, str) and password and password not in placeholders:
-                return password
-        return None
+    async def _nickserv_identify(self):
+        """Identify with NickServ (or Q) after registration, before joining channels.
 
-    def should_identify_nickserv(self) -> bool:
-        """True when we should PRIVMSG NickServ IDENTIFY after registration.
-
-        Explicit nickserv.enabled=false disables it. Otherwise identify when a
-        password is configured and SASL did not already authenticate us
-        (DALnet often ignore SASL; NickServ IDENTIFY is the reliable path).
+        Returns True only when an identify command was actually sent (the value is
+        ignored by the connect path, but it keeps this testable).
         """
-        enabled = self.get_config("nickserv.enabled")
-        if enabled is None:
-            enabled = self.get_config("connection.nickserv.enabled")
-        if enabled is False:
-            return False
-        if self.sasl_handler.authenticated:
-            return False
-        if not self._nickserv_password():
-            return False
-        if enabled is True:
+        try:
+            nickserv_cfg = self.get_config("nickserv")
+            if not isinstance(nickserv_cfg, dict) or not nickserv_cfg.get("enabled", False):
+                return False
+            # SASL already authenticated this nick during registration, so a second
+            # NickServ identify would only re-send the password for nothing.
+            if getattr(self.sasl_handler, "authenticated", False):
+                self.logger.info(
+                    "Skipping NickServ identify: SASL already authenticated this session"
+                )
+                return False
+            service = nickserv_cfg.get("service", "NickServ")
+            password = nickserv_cfg.get("password", "")
+            if not password:
+                self.logger.warning("NickServ enabled but no password configured")
+                return False
+            command = nickserv_cfg.get("command", "identify")
+            username = nickserv_cfg.get("username", "")
+            delay = float(nickserv_cfg.get("identify_delay", 1.0) or 1.0)
+
+            # Respect the configured delay before sending to avoid racing the server
+            await asyncio.sleep(delay)
+
+            if username and command == "auth":
+                # QuakeNet Q format: PRIVMSG Q@CServe.quakenet.org :auth <user> <pass>
+                self.send_raw(f"PRIVMSG {service} :{command} {username} {password}")
+            else:
+                # Standard NickServ: PRIVMSG NickServ :identify <password>
+                self.send_raw(f"PRIVMSG {service} :{command} {password}")
+            self.logger.info(f"Sent NickServ identify ({command}) to {service}")
+            if self.writer:
+                try:
+                    await self.writer.drain()
+                except Exception:
+                    pass
             return True
-        if self.get_config("sasl.enabled", False):
-            return True
-        return bool(
-            self.get_config("nickserv.password")
-            or self.get_config("connection.nickserv.password")
-        )
-
-    def _nickserv_username(self) -> str:
-        """Q/NickServ account name (may differ from IRC nick)."""
-        for path in ("nickserv.username", "connection.nickserv.username"):
-            username = self.get_config(path)
-            if isinstance(username, str) and username.strip():
-                return username.strip()
-        return self.get_config("connection.nick", "DuckHunt") or "DuckHunt"
-
-    def identify_nickserv(self, *, reclaim: bool = False) -> bool:
-        """Send services auth (NickServ IDENTIFY or QuakeNet Q auth). Never logs password."""
-        password = self._nickserv_password()
-        if not password:
+        except Exception as e:
+            self.logger.error(f"Error in NickServ identification: {e}")
             return False
-        desired_nick = self.get_config("connection.nick", "DuckHunt") or "DuckHunt"
-        auth_user = self._nickserv_username()
-        service = (
-            self.get_config("nickserv.service")
-            or self.get_config("connection.nickserv.service")
-            or "NickServ"
-        )
-        command = (
-            self.get_config("nickserv.command")
-            or self.get_config("connection.nickserv.command")
-            or "identify"
-        )
-        command = str(command).lower()
 
-        if command == "auth":
-            # QuakeNet: /msg Q@CServe.quakenet.org AUTH <username> <password>
-            self.send_raw(f"PRIVMSG {service} :AUTH {auth_user} {password}")
-        elif auth_user.lower() == (self.current_nick or "").lower():
-            # Rizon and most networks when already on the registered nick:
-            # /msg NickServ IDENTIFY password
-            self.send_raw(f"PRIVMSG {service} :IDENTIFY {password}")
-        else:
-            # DALnet/Guest or identifying for a different account nick:
-            # /msg NickServ IDENTIFY nick password
-            self.send_raw(f"PRIVMSG {service} :IDENTIFY {auth_user} {password}")
+    async def _apply_umode(self):
+        """Unset host-cloak umodes so the real rDNS hostname is visible.
 
-        if reclaim and self.current_nick.lower() != desired_nick.lower():
-            self.send_raw(f"NICK {desired_nick}")
-            self.logger.info(
-                "Sent services %s for account %s and reclaiming nick %s (was %s)",
-                command,
-                auth_user,
-                desired_nick,
-                self.current_nick,
-            )
-        else:
-            self.logger.info(
-                "Sent services %s for account %s via %s",
-                command,
-                auth_user,
-                service,
-            )
-        return True
+        Configured per connection as ``connection.umode`` (e.g. ``-x`` on Rizon,
+        ``-H`` on DALnet). Sent after NickServ identify and before channel JOINs.
+        """
+        try:
+            umode = self.get_config("connection.umode")
+            if not isinstance(umode, str):
+                return
+            umode = umode.strip()
+            if not umode:
+                return
 
-    def _join_configured_channels(self):
-        channels = self.get_config("connection.channels", []) or []
-        for channel in channels:
-            try:
-                self.send_raw(f"JOIN {channel}")
-                if not hasattr(self, "pending_joins") or not isinstance(
-                    self.pending_joins, dict
-                ):
-                    self.pending_joins = {}
-                self.pending_joins[self._channel_key(channel)] = None
-            except Exception as e:
-                self.logger.error(f"Error joining channel {channel}: {e}")
+            nick = self.current_nick or self.get_config("connection.nick", "DuckHunt")
+            if not nick:
+                return
+
+            delay = float(self.get_config("connection.umode_delay", 0.5) or 0.5)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            self.send_raw(f"MODE {nick} {umode}")
+            self.logger.info(f"Sent umode change: MODE {nick} {umode}")
+            if self.writer:
+                try:
+                    await self.writer.drain()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.error(f"Error applying umode: {e}")
 
     async def handle_message(self, prefix, command, params, trailing):
         """Handle incoming IRC messages with comprehensive error handling"""
@@ -910,54 +895,30 @@ class DuckHuntBot:
                     f"Successfully registered with IRC server as {self.current_nick}"
                 )
 
-                # DALnet (and similar) often do not complete SASL; identify via
-                # NickServ immediately, then join so ENFORCE cannot Guest* us.
-                if self.should_identify_nickserv():
-                    self.identify_nickserv()
-                    delay = float(
-                        self.get_config("nickserv.identify_delay")
-                        or self.get_config("connection.nickserv.identify_delay")
-                        or 1.0
-                    )
+                # Attempt NickServ identification BEFORE joining channels
+                await self._nickserv_identify()
+                # Drop host cloak (+x / +H) so rDNS hostname is visible in WHOIS/hostmasks
+                await self._apply_umode()
 
-                    async def _join_after_identify():
-                        try:
-                            await asyncio.sleep(max(0.0, delay))
-                            self._join_configured_channels()
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as e:
-                            self.logger.error(f"Error joining after NickServ: {e}")
-
-                    self._track_task(_join_after_identify())
-                else:
-                    self._join_configured_channels()
-
-            elif command == "NICK":
-                # Track our own nick changes (e.g. DALnet ENFORCE -> Guest####).
-                if prefix and "!" in prefix:
-                    old_nick = prefix.split("!", 1)[0]
-                    new_nick = trailing or (params[0] if params else "")
-                    if (
-                        old_nick
-                        and new_nick
-                        and old_nick.lower() == (self.current_nick or "").lower()
-                    ):
-                        self.current_nick = new_nick
-                        self.logger.info(f"Nick changed: {old_nick} -> {new_nick}")
-                        desired = (
-                            self.get_config("connection.nick", "DuckHunt") or "DuckHunt"
-                        )
-                        if (
-                            new_nick.lower().startswith("guest")
-                            and new_nick.lower() != desired.lower()
-                            and self.should_identify_nickserv()
+                channels = self.get_config("connection.channels", []) or []
+                for channel in channels:
+                    try:
+                        self.send_raw(f"JOIN {channel}")
+                        # Wait for server JOIN confirmation before marking joined.
+                        if not hasattr(self, "pending_joins") or not isinstance(
+                            self.pending_joins, dict
                         ):
-                            self.identify_nickserv(reclaim=True)
+                            self.pending_joins = {}
+                        self.pending_joins[self._channel_key(channel)] = None
+                    except Exception as e:
+                        self.logger.error(f"Error joining channel {channel}: {e}")
 
-            elif command in {"433", "436"}:
-                # Nickname in use / nick collision. Without this the bot would never
-                # register (NICK is only sent once) and hang silently forever.
+            elif command in {"432", "433", "436"}:
+                # 432 = Erroneous nickname (e.g. held by services enforcer)
+                # 433 = Nickname in use
+                # 436 = Nick collision
+                # Without this the bot would never register (NICK is only sent
+                # once) and hang silently forever.
                 if not self.registered:
                     self._nick_attempts += 1
                     base = self.get_config("connection.nick", "DuckHunt") or "DuckHunt"
@@ -1106,7 +1067,7 @@ class DuckHuntBot:
     async def handle_command(self, user, channel, message):
         """Handle bot commands with enhanced error handling and input validation"""
         try:
-            # Validate input parameters
+            # Accept configured prefix (default "!") and always also "." (CodeVaultX fork).
             if not isinstance(message, str) or not (
                 message.startswith(self.command_prefix) or message.startswith(".")
             ):
@@ -1128,7 +1089,11 @@ class DuckHuntBot:
             )
             safe_channel = self._sanitize_channel(channel)
 
-            used_prefix = self.command_prefix if safe_message.startswith(self.command_prefix) else "."
+            used_prefix = (
+                self.command_prefix
+                if safe_message.startswith(self.command_prefix)
+                else "."
+            )
             if not safe_message.startswith(used_prefix):
                 return
 
@@ -1769,7 +1734,7 @@ class DuckHuntBot:
             # One short public list + pointer to PM, like classic DuckHunt bots.
             self.send_message(
                 channel,
-                f"[Duck Hunt commands] {p}help, {p}bang, {p}bef, {p}reload, "
+                f"[Duck Hunt commands] {p}help, {p}bang, {p}bef, {p}reload, {p}rearm, "
                 f"{p}shop, {p}topduck, {p}duckstats, {p}daily, {p}inv, "
                 f"{p}use, {p}give, {p}globaltop.",
             )
@@ -1783,7 +1748,7 @@ class DuckHuntBot:
         self.send_message(nick, "To get a more detailed list use 'help full'")
         self.send_message(
             nick,
-            f"Channel commands: {p}bang, {p}bef, {p}reload, {p}shop, "
+            f"Channel commands: {p}bang, {p}bef, {p}reload, {p}rearm, {p}shop, "
             f"{p}duckstats, {p}topduck, {p}globaltop, {p}daily, {p}inv, "
             f"{p}effects, {p}profile, {p}achievements, {p}use, {p}give",
         )
@@ -1799,16 +1764,18 @@ class DuckHuntBot:
             f"{p}duckstats [player]: Your (or another player's) hunting stats for this channel.",
             f"{p}topduck: Top players by XP in the current channel.",
             f"{p}globaltop: Top players by XP across all channels on this server.",
-            f"{p}shop: List items. Buy with {p}shop buy <item number> [target].",
+            f"{p}shop: List items. Buy with {p}shop buy <id> [target].",
             f"{p}use <item_id> [target]: Use an item from your inventory.",
             f"{p}give <item_id> <player>: Give an inventory item to another player.",
             f"{p}daily: Claim your daily XP bonus (24h cooldown, builds streaks).",
+            f"{p}rearm: Rearm yourself after your gun was confiscated (any player).",
             f"{p}inv: Quick view of your inventory.",
             f"{p}effects: Active temporary buffs and timers.",
             f"{p}profile: Detailed hunter stat card (PM).",
             f"{p}achievements: Your earned badges (PM).",
             "Admin (in-channel or PM where noted): "
-            f"{p}rearm, {p}disarm, {p}ignore, {p}unignore, {p}ducklaunch, {p}join, {p}part",
+            f"{p}rearm <player|all>, {p}disarm, {p}ignore, {p}unignore, {p}ducklaunch, "
+            f"{p}join, {p}part",
         ]
         for line in help_lines:
             self.send_message(nick, line)
@@ -2279,113 +2246,142 @@ class DuckHuntBot:
                 channel, f"{nick} > Usage: {self.command_prefix}give <item_id> <player>"
             )
 
-    async def handle_rearm(self, nick, channel, args):
-        """Handle !rearm command (admin only) - supports private messages"""
+    def _apply_rearm(self, player):
+        """Clear confiscation and refill magazines for one player record."""
+        player["gun_confiscated"] = False
+        self.levels.update_player_magazines(player, full_reload=True)
+        player["current_ammo"] = player.get("bullets_per_magazine", 6)
+
+    # !rearm request kinds (see _classify_rearm_request).
+    REARM_SELF = "self"
+    REARM_ALL = "all"
+    REARM_OTHER = "other"
+    REARM_INVALID = "invalid"
+
+    def _classify_rearm_request(self, nick, args):
+        """Classify a !rearm invocation into ``(kind, target)``.
+
+        - ``("self", nick)``    -> ``!rearm`` or ``!rearm <own nick>`` (any player)
+        - ``("all", None)``     -> ``!rearm all`` (admins only)
+        - ``("other", target)`` -> ``!rearm <someone else>`` (admins only)
+        - ``("invalid", None)`` -> too many arguments / no usable target
+
+        Split out of the handler so the permission rules stay testable without a
+        live bot, database or IRC connection.
+        """
+        cleaned = [a.strip() for a in (args or []) if isinstance(a, str) and a.strip()]
+        if not cleaned:
+            return (self.REARM_SELF, nick)
+        if len(cleaned) > 1:
+            return (self.REARM_INVALID, None)
+        target = cleaned[0]
+        if target.lower() == "all":
+            return (self.REARM_ALL, None)
+        if target.lower() == nick.lower():
+            return (self.REARM_SELF, target)
+        return (self.REARM_OTHER, target)
+
+    async def handle_rearm(self, nick, channel, args, user=None):
+        """Handle !rearm.
+
+        Permission model (kept in sync with messages.json / the help text):
+        - ``!rearm`` / ``!rearm <own nick>``: any player, in a channel.
+        - ``!rearm all``: admins only - current channel, or every channel via PM.
+        - ``!rearm <other nick>``: admins only.
+        """
         is_private_msg = not channel.startswith("#")
         reply_target = nick if is_private_msg else channel
+        is_admin = bool(user and self.is_admin(user))
+        p = self.command_prefix
+        kind, target = self._classify_rearm_request(nick, args)
 
-        if not args:
-            if is_private_msg:
-                self.send_message(
-                    reply_target,
-                    f"{nick} > Usage: {self.command_prefix}rearm all | {self.command_prefix}rearm <channel> <player>",
-                )
-                return
-
-            # Rearm the admin themselves (only in channels)
-            player = self.db.get_player(nick, channel)
-
-            player["gun_confiscated"] = False
-
-            # Update magazines based on admin's level
-            self.levels.update_player_magazines(player, full_reload=True)
-            player["current_ammo"] = player.get("bullets_per_magazine", 6)
-
-            message = self.messages.get("admin_rearm_self", admin=nick)
-            self.send_message(reply_target, message)
-            self.db.save_database()
+        if kind == self.REARM_INVALID:
+            self.send_message(
+                reply_target,
+                f"{nick} > Usage: {p}rearm [your nick] | admins: {p}rearm <player> "
+                f"or {p}rearm all",
+            )
             return
 
-        # Determine the target nick/channel. In a channel, the invoking channel is
-        # implicit. In PM, a specific player requires an explicit target channel
-        # (there's no other way to know which channel's copy of that player to touch),
-        # matching the pattern already used by !ducklaunch.
-        if is_private_msg:
-            if args[0].lower() == "all":
-                target_nick = "all"
-                target_channel = None
-            elif len(args) >= 2:
-                target_channel = args[0]
-                target_nick = args[1]
-            else:
+        # Admin-only: rearm everyone (current channel, or all channels via PM).
+        if kind == self.REARM_ALL:
+            if not is_admin:
                 self.send_message(
                     reply_target,
-                    f"{nick} > Usage: {self.command_prefix}rearm all | {self.command_prefix}rearm <channel> <player>",
+                    f"{nick} > Only admins can rearm all players.",
                 )
                 return
-        else:
-            target_channel = channel
-            target_nick = args[0]
 
-        # Check if admin wants to rearm all players
-        if target_nick.lower() == "all":
             rearmed_count = 0
             if is_private_msg:
-                for _ch, _pn, p in self.db.iter_all_players():
-                    if p.get("gun_confiscated", False):
-                        p["gun_confiscated"] = False
-                        self.levels.update_player_magazines(p, full_reload=True)
-                        p["current_ammo"] = p.get("bullets_per_magazine", 6)
+                for _ch, _pn, pl in self.db.iter_all_players():
+                    if pl.get("gun_confiscated", False):
+                        self._apply_rearm(pl)
                         rearmed_count += 1
-            else:
-                for _pn, p in self.db.get_players_for_channel(channel).items():
-                    if p.get("gun_confiscated", False):
-                        p["gun_confiscated"] = False
-                        self.levels.update_player_magazines(p, full_reload=True)
-                        p["current_ammo"] = p.get("bullets_per_magazine", 6)
-                        rearmed_count += 1
-
-            if is_private_msg:
                 message = f"{nick} > Rearmed all players ({rearmed_count} players)"
             else:
+                for _pn, pl in self.db.get_players_for_channel(channel).items():
+                    if pl.get("gun_confiscated", False):
+                        self._apply_rearm(pl)
+                        rearmed_count += 1
                 message = self.messages.get("admin_rearm_all", admin=nick)
             self.send_message(reply_target, message)
             self.db.save_database()
             return
 
-        # Validate the target channel when invoked via PM
-        if is_private_msg:
-            target_channel_key = self._channel_key(target_channel)
-            if target_channel_key not in self.channels_joined:
+        if kind == self.REARM_OTHER:
+            if not is_admin:
                 self.send_message(
                     reply_target,
-                    f"{nick} > Channel {target_channel} is not available for duckhunt",
+                    f"{nick} > Only admins can rearm other players - use {p}rearm to "
+                    f"rearm yourself.",
                 )
                 return
-            lookup_channel = target_channel_key
-        else:
-            lookup_channel = channel
-
-        player, error_msg = self._get_admin_target_player(
-            nick, lookup_channel, target_nick
-        )
-
-        if error_msg:
-            self.send_message(reply_target, f"{nick} > {error_msg}")
+            if is_private_msg:
+                # In PM there's no way to know which channel's copy of the target to
+                # touch (the lookup would land in the shared '__pm__' bucket and operate
+                # on a phantom player), so this requires the player's channel.
+                self.send_message(
+                    reply_target,
+                    f"{nick} > Use {p}rearm <player> in that player's channel, "
+                    f"or {p}rearm all.",
+                )
+                return
+            target_player = self.db.get_player_if_exists(target, channel)
+            if target_player is None:
+                self.send_message(
+                    reply_target,
+                    f"{nick} > {target} has no record in {channel}.",
+                )
+                return
+            self._apply_rearm(target_player)
+            message = self.messages.get("admin_rearm_player", admin=nick, target=target)
+            self.send_message(reply_target, message)
+            self.db.save_database()
             return
 
-        # Rearm the target player
-        if player is not None:
-            player["gun_confiscated"] = False
-            self.levels.update_player_magazines(player, full_reload=True)
-            player["current_ammo"] = player.get("bullets_per_magazine", 6)
-
+        # kind == REARM_SELF: public self-service, channels only.
         if is_private_msg:
-            message = f"{nick} > Rearmed {target_nick} in {lookup_channel}"
-        else:
-            message = self.messages.get(
-                "admin_rearm_player", target=target_nick, admin=nick
+            self.send_message(
+                reply_target,
+                f"{nick} > Use {p}rearm in a channel (not in PM). Admins: {p}rearm all",
             )
+            return
+
+        # features.auto_rearm_enabled = false turns self-service rearm off for
+        # everyone except admins (the config switch is no longer dead config).
+        if not is_admin and not bool(
+            self.get_config("features.auto_rearm_enabled", True)
+        ):
+            self.send_message(
+                reply_target,
+                f"{nick} > Self-rearm is disabled - ask an admin to rearm you.",
+            )
+            return
+
+        player = self.db.get_player(nick, channel)
+        self._apply_rearm(player)
+        message = self.messages.get("player_rearm_self", nick=nick)
         self.send_message(reply_target, message)
         self.db.save_database()
 
@@ -2791,10 +2787,20 @@ class DuckHuntBot:
                     self._last_activity = time.monotonic()
                     self._lag_ping_sent = None
 
+                    # Log raw data for debugging
+                    if line:
+                        decoded = line.decode("utf-8", errors="replace").strip()
+                        self.logger.debug(f"RECV: {decoded[:200]}")
+
                 except asyncio.TimeoutError:
                     # Idle: run the lag watchdog. A half-dead TCP connection (no RST)
                     # never returns EOF, so without this the bot would sit here
                     # forever as a zombie after a silent network drop.
+                    self._idle_reads = getattr(self, "_idle_reads", 0) + 1
+                    if self._idle_reads % 10 == 0:
+                        self.logger.debug(
+                            f"Waiting for server data... ({self._idle_reads}s elapsed)"
+                        )
                     if self._check_connection_stale():
                         break
                     continue
@@ -2925,24 +2931,27 @@ class DuckHuntBot:
                 # Send server password immediately after connection (RFC requirement)
                 await self.send_server_password()
 
-                # Check if SASL should be used
+                # Always send CAP LS 302 first (standard IRCv3 registration).
+                # Servers like Rizon expect proper CAP negotiation and will
+                # send CAP * LS back; we handle that in handle_cap_response.
+                # Servers like DALnet (bahamut-2.2.x) ignore CAP LS entirely;
+                # a short timeout fallback sends NICK/USER directly.
+                self.send_raw("CAP LS 302")
+                if self.writer:
+                    try:
+                        await self.writer.drain()
+                    except Exception:
+                        pass
+
+                self.sasl_handler.cap_negotiating = True
                 if self.sasl_handler.should_authenticate():
-                    await self.sasl_handler.start_negotiation()
+                    self.sasl_handler._start_timeout_watchdog()
                 else:
-                    await self.register_user()
+                    # No SASL — if no CAP LS response within 3s, register
+                    # directly (for DALnet/bahamut which ignore CAP LS).
+                    self._track_task(self._fallback_register_after_delay(3))
 
                 message_task = asyncio.create_task(self.message_loop())
-                # If the server never issues 001 (registration), close early so we
-                # reconnect instead of sitting unreistered until the peer drops us.
-                # Do not include this task in the wait() set below: when registration
-                # succeeds the watch exits cleanly and FIRST_COMPLETED would wrongly
-                # treat that as "connection died" and reconnect every healthy bot.
-                reg_timeout = float(
-                    self.get_config("connection.registration_timeout", 90) or 90
-                )
-                registration_watch = asyncio.create_task(
-                    self._registration_timeout_watch(reg_timeout)
-                )
 
                 self.logger.info("Bot is now running! Press Ctrl+C to stop.")
                 # Wait for shutdown signal or task completion with frequent checks
@@ -2956,13 +2965,6 @@ class DuckHuntBot:
                     # If any task completed, break out
                     if done:
                         break
-
-                if not registration_watch.done():
-                    registration_watch.cancel()
-                    try:
-                        await registration_watch
-                    except asyncio.CancelledError:
-                        pass
 
                 # Connection ended (or shutdown). Tear down this connection cleanly.
                 if not message_task.done():

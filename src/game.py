@@ -1046,18 +1046,52 @@ class DuckGame:
             self.logger.error(f"Error checking insurance: {e}")
         return False
 
-    def _clean_expired_effects(self):
-        """Remove expired temporary effects from all players."""
+    def _clean_expired_effects(self) -> bool:
+        """Remove expired temporary effects from all players.
+
+        Also enforces ``limits.max_temp_effects`` per player (the key was dead config
+        before): when a record somehow holds more effects than the limit, the ones
+        expiring soonest are dropped and the longest-lasting ones are kept.
+
+        Returns True when something was changed, so the caller can persist it.
+        """
         current_time = time.time()
+        try:
+            limit = int(self.bot.get_config("limits.max_temp_effects", 20) or 20)
+        except (TypeError, ValueError):
+            limit = 20
+        limit = max(1, limit)
+
+        changed = False
         try:
             for _ch, player_name, player_data in self.db.iter_all_players():
                 effects = player_data.get("temporary_effects", [])
+                if not isinstance(effects, list):
+                    continue
                 active = [e for e in effects if e.get("expires_at", 0) > current_time]
+                if len(active) > limit:
+                    # Keep the effects that last longest; drop the oldest-expiring extras.
+                    active.sort(
+                        key=lambda e: e.get("expires_at", 0)
+                        if isinstance(e, dict)
+                        else 0,
+                        reverse=True,
+                    )
+                    active = active[:limit]
                 if len(active) != len(effects):
                     player_data["temporary_effects"] = active
+                    changed = True
                     self.logger.debug(f"Cleaned expired effects for {player_name}")
         except Exception as e:
             self.logger.error(f"Error cleaning expired effects: {e}")
+
+        if changed:
+            # Persist the cleanup so it isn't redone (and re-logged) on every tick.
+            try:
+                self.db.save_database()
+            except Exception as e:
+                self.logger.error(f"Error saving after effect cleanup: {e}")
+        return changed
 
     def _get_active_effect(self, player, effect_type: str):
         """Return the first active effect matching effect_type, or None."""

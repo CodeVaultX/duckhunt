@@ -133,9 +133,19 @@ duckhunt.log*
 # Runtime files (do not commit)
 duckhunt.json
 duckhunt_*.json
-config.json
+# Any local config carries live IRC/NickServ/SASL passwords: never commit these.
+config*.json
+!config.json.example
+config.bak.json
+nohup.out
 duckhunt.json.bak
 duckhunt_*.json.bak
+# Quarantined/unreadable DB snapshots and pre-migration backups
+duckhunt*.json.corrupt-*
+duckhunt*.json.legacy-backup-*
+# Output of migrate_per_server_db.py
+db_split_report.json
+db_backup_*/
 
 # IDE files
 .vscode/

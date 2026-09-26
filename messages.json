@@ -69,6 +69,8 @@
   "admin_rearm_player": "[ADMIN] {target} has been rearmed by {admin}",
   "admin_rearm_all": "[ADMIN] All players have been rearmed by {admin}",
   "admin_rearm_self": "[ADMIN] {admin} has rearmed themselves",
+  "player_rearm_self": "{nick} > You have been rearmed.",
+  "player_rearm_player": "{nick} > {target} has been rearmed.",
   "admin_disarm": "[ADMIN] {target} has been disarmed by {admin}",
   "admin_ignore": "[ADMIN] {target} is now ignored by {admin}",
   "admin_unignore": "[ADMIN] {target} is no longer ignored by {admin}",

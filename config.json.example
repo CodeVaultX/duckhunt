@@ -1,19 +1,20 @@
 {
-  "_comment_connections": "List one or more IRC servers. Each entry gets its own bot instance and database file (duckhunt_<server>.json). Same channel names on different servers stay isolated. Legacy single 'connection' object is still accepted.",
-  "_comment_enabled": "Per server: set \"enabled\": false to disable without deleting the block. Omit enabled or use true to connect. Optional \"label\" is only for your notes / log messages. Restart the bot after changes.",
+  "_comment_connections": "One entry per IRC server (preferred). Each entry gets its own bot connection and its own database file (duckhunt_<server>.json), so the same channel name on two networks never shares players. A single top-level \"connection\" object is still accepted for one-server setups.",
+  "_comment_db_file": "Optional per entry: \"db_file\": \"myfile.json\" overrides that server's database file name. Without a 'server' value the legacy shared duckhunt.json is used.",
   "connections": [
     {
-      "label": "QuakeNet",
+      "label": "Example network",
       "enabled": true,
-      "server": "irc.quakenet.org",
-      "port": 6667,
-      "nick": "DuckHunt",
+      "server": "irc.example.net",
+      "port": 6697,
+      "nick": "Quackbot",
       "channels": [
-		"#Online",
-        "#Offline"
+        "#duckhunt"
       ],
-      "ssl": false,
-      "ssl_verify": false,
+      "ssl": true,
+      "ssl_verify": true,
+      "_comment_bind_address": "Optional: outbound source IP (e.g. an IPv6 address with matching rDNS). Must belong to this host. Leave empty to let the OS choose.",
+      "bind_address": "",
       "password": "",
       "max_retries": 3,
       "retry_delay": 5,
@@ -40,98 +41,26 @@
         "username": "",
         "password": ""
       },
-	  "nickserv": {
-        "enabled": true,
-        "service": "Q@CServe.quakenet.org",
-        "command": "auth",
-		"username": "AuthNick",
-        "password": "AuthPass",
-        "identify_delay": 1.0
-      }
-    },
-    {
-      "label": "Rizon",
-      "enabled": true,
-      "server": "irc.rizon.net",
-      "port": 6697,
-      "nick": "DuckHunt",
-      "channels": [
-        "#Online",
-        "#Offline"
-      ],
-      "ssl": true,
-      "ssl_verify": true,
-      "password": "",
-      "max_retries": 3,
-      "retry_delay": 5,
-      "timeout": 30,
-      "send_throttle": 0.3,
-      "reconnect": {
-        "enabled": true,
-        "initial_delay": 5,
-        "max_delay": 300
-      },
-      "ping_interval": 120,
-      "ping_timeout": 60,
-      "auto_rejoin": {
-        "enabled": true,
-        "retry_interval": 20,
-        "max_rejoin_attempts": 100
-      },
-      "_comment_sasl": "Optional per-server SASL. Omit to use the top-level sasl block below.",
-      "sasl": {
-        "enabled": false,
-        "username": "",
-        "password": ""
-      },
+      "_comment_nickserv": "Optional per-server services login. 'command' defaults to 'identify' (NickServ); QuakeNet's Q uses \"command\": \"auth\" plus \"username\". Skipped automatically when SASL already authenticated.",
       "nickserv": {
-        "enabled": true,
+        "enabled": false,
         "service": "NickServ",
-        "password": "YourPass",
+        "password": "",
         "identify_delay": 1.0
       }
     },
     {
-      "label": "DALnet",
-      "enabled": true,
-      "server": "irc.dal.net",
-      "port": 6697,
-      "nick": "DuckHunt",
+      "label": "Second network (disabled example)",
+      "enabled": false,
+      "server": "irc.other.example",
+      "port": 6667,
+      "nick": "DuckHunt2",
       "channels": [
-        "#Online",
-        "#Offline"
+        "#duckhunt"
       ],
-      "ssl": true,
-      "ssl_verify": true,
-      "password": "",
-      "max_retries": 3,
-      "retry_delay": 5,
-      "timeout": 30,
-      "send_throttle": 0.3,
-      "reconnect": {
-        "enabled": true,
-        "initial_delay": 5,
-        "max_delay": 300
-      },
-      "ping_interval": 120,
-      "ping_timeout": 60,
-      "auto_rejoin": {
-        "enabled": true,
-        "retry_interval": 20,
-        "max_rejoin_attempts": 100
-      },
-      "_comment_sasl": "Optional per-server SASL. Omit to use the top-level sasl block below.",
-      "sasl": {
-        "enabled": false,
-        "username": "",
-        "password": ""
-      },
-      "nickserv": {
-        "enabled": true,
-        "service": "NickServ@services.dal.net",
-        "password": "YourPass",
-        "identify_delay": 1.0
-      }
+      "ssl": false,
+      "ssl_verify": false,
+      "password": ""
     }
   ],
   "sasl": {
@@ -140,8 +69,7 @@
     "password": ""
   },
   "admins": [
-    "OwnerNick1",
-    "OwnerNick2"
+    "yourNickHere"
   ],
   "_comment_admins": "For stronger security than nick-only auth (spoofable if someone else takes that nick), use hostmask entries instead, e.g.: \"admins\": [{\"nick\": \"yourNickHere\", \"hostmask\": \"*!youruser@your.host\"}]",
   "commands": {
@@ -149,24 +77,24 @@
     "prefix": "!"
   },
   "duck_spawning": {
-    "spawn_min": 600,
-    "spawn_max": 1200,
-    "_comment_timeout": "Default seconds before an unshot duck flies away (300 = 5 min). Per-type overrides in duck_types.*.timeout",
-    "timeout": 300,
+    "spawn_min": 1200,
+    "spawn_max": 3600,
+    "timeout": 60,
     "rearm_on_duck_shot": true
   },
   "channel_overrides": {
     "_comment": "Per-channel settings. Keys must be lowercase. Only include settings you want to override.",
-    "#test": {
+    "#slow-channel": {
       "duck_spawning": {
-        "spawn_min": 600,
-        "spawn_max": 1200
+        "spawn_min": 3600,
+        "spawn_max": 3600
       }
     }
   },
   "duck_types": {
     "normal": {
       "xp": 10,
+      "timeout": 60,
       "drop_chance": 0.15
     },
     "golden": {
@@ -174,6 +102,7 @@
       "min_hp": 3,
       "max_hp": 5,
       "xp": 15,
+      "timeout": 60,
       "drop_chance": 0.5
     },
     "fast": {
@@ -186,6 +115,7 @@
       "chance": 0.10,
       "dodge_chance": 0.35,
       "xp": 15,
+      "timeout": 60,
       "drop_chance": 0.3
     }
   },
@@ -227,9 +157,15 @@
     "befriend_success_rate": 75,
     "befriend_xp": 5,
     "accuracy_gain_on_hit": 1,
-    "accuracy_loss_on_miss": 2,
-    "min_accuracy": 10,
+    "_comment_accuracy_loss_on_miss": "Accuracy lost per missed shot. Keeping this low (1) means a bad streak doesn't ruin a player's hit chance.",
+    "accuracy_loss_on_miss": 1,
+    "_comment_min_accuracy": "Hard lower bound for accuracy, so nobody ends up missing most of their shots. 50 = worst case is a coin flip.",
+    "min_accuracy": 50,
     "max_accuracy": 100,
+    "_comment_accuracy_soft_cap": "One-time per database file (stored in the DB metadata): accuracy above this is lowered once.",
+    "accuracy_soft_cap": 90,
+    "_comment_accuracy_floor": "One-time per database file (stored in the DB metadata): accuracy below this is raised once.",
+    "accuracy_floor": 65,
     "min_befriend_success_rate": 5,
     "max_befriend_success_rate": 95,
     "wet_clothes_duration": 300

@@ -58,8 +58,12 @@ SASL and NickServ can be configured **per connection**, overriding global defaul
 - **`duck_spawning.timeout`** — global duck fly-away timeout (seconds) is now respected; per-type overrides in `duck_types.*.timeout` still work.
 - **Unicode channel names** — channels like `#Fenerbahçe` are handled correctly (no broken replies from ASCII-only sanitization).
 - **Per-server enable/disable** — run only the networks you need without editing channel lists each time.
-- **Smoke tests** — `tests/test_smoke.py` covers multi-server config, NickServ hoisting, and QuakeNet auth.
-- **Windows helpers** (optional) — `start_hidden.vbs` / `stop_duckhunt.vbs` for background startup (use a Startup **shortcut**, not a copied VBS).
+- **Smoke tests** — `tests/test_smoke.py` covers multi-server config, NickServ hoisting, QuakeNet auth, per-server DB isolation and the `!rearm` handler.
+- **Isolated per-server databases** — every connection gets its own `duckhunt_<server>.json` (override with `db_file`), so the same channel name on two networks never shares stats and bots can no longer overwrite each other's data.
+- **Persistent migration metadata** — the DB `metadata` block is now saved, so one-time migrations (accuracy soft-cap/floor) run once per file instead of on every start.
+- **Safer saves** — unique temp file per write (`<db>.<pid>-<token>.tmp`), background saves are awaited on load/shutdown, and `TimeoutError` is handled on Python 3.9/3.10.
+- **Self-service `!rearm`** — players can rearm themselves; rearming others or `all` stays admin-only.
+- **Migration tool** — `migrate_per_server_db.py` splits an old shared `duckhunt.json` into per-server files with a read-only `--verify` mode.
 
 ---
 
@@ -200,9 +204,20 @@ python -m unittest discover -s tests -p "test_*.py"
 | `duck_spawning.spawn_min` / `spawn_max` | Random spawn interval in **seconds** |
 | `duck_spawning.timeout` | Seconds before an unshot duck flies away (global default) |
 | `duck_types.*.timeout` | Per duck-type timeout override |
+| `connections[].bind_address` | Optional. Outbound source IP/vhost the bot connects from (e.g. an IPv6 address with matching rDNS). Must be an address that belongs to your host; leave empty or omit for the OS default |
 | `connection.ssl_verify` | Keep `true` in production; `false` only for self-signed certs |
 
 **Admin security:** plain-string admins (`"colby"`) authenticate by nick only. Use hostmask objects for production.
+
+### Optional: bind address (vhost)
+
+To make the bot connect from a specific IP (for example an IPv6 address with your own rDNS), set `bind_address` inside a connection entry:
+
+```json
+{ "server": "irc.ipv6.quakenet.org", "port": 6667, "bind_address": "2001:db8::1234" }
+```
+
+The address must be assigned to the machine the bot runs on, and the IRC server must support that IP family (IPv6 needs a server with an AAAA record). Empty or missing = the OS picks the source address.
 
 ---
 
@@ -234,8 +249,7 @@ Throughout this section:
 | `!profile` or `.profile` | Detailed stat card (PM) |
 | `!achievements` or `.achievements` | Earned badges (PM) |
 | `!help` / `!duckhelp` or `.help` / `.duckhelp` | Help (see [Help commands](#help-commands-new-behaviour) above) |
-| `!rearm` or `.rearm` | Channel | Rearm yourself |
-| `!rearm <player>` or `.rearm <player>` | Channel | Rearm one player in current channel |
+| `!rearm` or `.rearm` | Rearm yourself (open to everyone; `!rearm <your nick>` also works) |
 ### Help usage (summary)
 
 ```
@@ -258,6 +272,7 @@ Admins must match `admins` in config (hostmask recommended).
 
 | Command | Where | Description |
 |---|---|---|
+| `!rearm <player>` | Channel | Rearm another player in current channel |
 | `!rearm all` | Channel | Rearm all confiscated players in channel |
 | `!rearm all` | PM | Rearm all players on this server |
 | `!rearm <#channel> <player>` | PM | Rearm a specific player in a channel |
@@ -317,7 +332,21 @@ XP, level, streaks, ducks shot/befriended, accuracy, inventory, active effects, 
 | `shop.json` | Shop catalog |
 | `messages.json` | Bot message templates |
 
-Writes are atomic with retry logic. Relative DB paths resolve to the project root, not the shell CWD.
+Every connection has its own database file named after the server (`irc.rizon.net` → `duckhunt_irc.rizon.net.json`); `connections[].db_file` overrides the name. The file's `metadata` records one-time migrations so they never re-run.
+
+Writes are atomic (unique temp file + `os.replace`, rolling `.bak`) with retry logic. Relative DB paths resolve to the project root, not the shell CWD.
+
+### Upgrading from a single shared `duckhunt.json`
+
+Stop the bot, then split the legacy file (it is only read, never modified or deleted):
+
+```bash
+python migrate_per_server_db.py --dry-run
+python migrate_per_server_db.py --logs logs --default-server irc.rizon.net
+python migrate_per_server_db.py --verify --logs logs --default-server irc.rizon.net
+```
+
+The splitter writes `db_split_report.json` listing which channels went to which server. `--verify` is read-only and checks that every legacy record exists unchanged in a per-server file. A channel configured on several servers is copied to each of them. Reassign a channel with `--assign "#channel=irc.dal.net" --force`; use `--out-dir` to write output elsewhere.
 
 ---
 
@@ -331,8 +360,8 @@ duckhunt/
 ├── levels.json
 ├── shop.json
 ├── messages.json
-├── start_hidden.vbs         # Optional Windows background launcher
-├── stop_duckhunt.vbs        # Optional Windows stop script
+├── migrate_per_server_db.py # One-time splitter: shared duckhunt.json -> per-server files
+├── pyproject.toml
 ├── tests/
 │   └── test_smoke.py
 └── src/
@@ -368,7 +397,8 @@ duckhunt/
 | Help | `!duckhelp` → full list in PM | `!help` / `.help` in channel + PM `help` / `help full` |
 | Nick/password auth | SASL (global) | SASL + per-server NickServ / QuakeNet Q |
 | Per-server on/off | — | `enabled: true/false` |
-| Database | `duckhunt.json` | `duckhunt_<server>.json` per network |
+| Database | `duckhunt.json` | `duckhunt_<server>.json` per network + migration tool |
+| `!rearm` | Admin only | Self-rearm for everyone; others/`all` admin-only |
 | Duck timeout config | Per-type only in practice | `duck_spawning.timeout` global fallback |
 | Unicode channels | — | Full Unicode channel names supported |
 

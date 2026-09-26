@@ -157,8 +157,8 @@ class LevelManager:
     def get_modified_accuracy(self, player: Dict[str, Any]) -> int:
         """Get player's accuracy modified by their level"""
         base_accuracy = player.get(
-            "accuracy", 75
-        )  # This will be updated by bot config in create_player
+            "accuracy", 70
+        )  # Matches player_defaults.accuracy; create_player uses config
         level_info = self.get_player_level_info(player)
         modifier = level_info.get("accuracy_modifier", 0)
 

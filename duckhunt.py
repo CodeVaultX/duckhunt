@@ -131,7 +131,12 @@ async def run_bots(bots):
 def main():
     """Main entry point for DuckHunt Bot"""
     try:
-        config_file = "config.json"
+        # Resolve config.json against this file's directory (the project root), not the
+        # process CWD, so the bot can be started from anywhere (shortcut, Task
+        # Scheduler, VBS launcher, ...) and still find its configuration.
+        config_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.json"
+        )
         if not os.path.exists(config_file):
             print("❌ config.json not found!")
             sys.exit(1)
